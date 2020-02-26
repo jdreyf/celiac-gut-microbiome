@@ -1,0 +1,223 @@
+---
+title: "Function Prediction"
+author: "Hui/Jonathan"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: word_document
+bibliography: B:/annotations/bib/bioinfo.bib
+---
+
+```{bash, echo = FALSE, eval = FALSE}
+ssh hp135@o2.hms.harvard.edu 
+cd /n/data1/joslin/cores/bbcore/celiac_disease_16sn/picrust2
+srun -c 4 -p interactive --pty --mem-per-cpu=8G -t 0-12 /bin/bash
+module load gcc/6.2.0 R/3.5.1; R
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE)
+#setwd("/home/hp135")
+setwd("B:/")
+source("fcns/config.r")
+source("fcns/fcns_limma/edger_contrasts.r")
+#setwd("/n/data1/joslin/cores/bbcore/celiac_disease_16sn/picrust2")
+setwd("external/altindis/celiac_disease_16sn/picrust2")
+library(biomformat)
+library(dada2)
+```
+
+## Data
+OTU table [seqtab_nochim.rds](../dada2/seqtab_nochim.rds), 
+Metadata table [taxonomy_table.csv](../phyloseq/metadata_table.csv), 
+
+## Make biom and fasta file
+```{r biom}
+seqtab_nochim <- readRDS("../dada2/seqtab_nochim.rds")
+uniquesToFasta(seqtab_nochim, "seq_nochim.fa", ids = paste0("Seq", 1:ncol(seqtab_nochim)))
+
+seqtab_nochim_matched <- seqtab_nochim
+colnames(seqtab_nochim_matched) <- paste0("Seq", 1:ncol(seqtab_nochim))
+st.biom <- make_biom(t(seqtab_nochim_matched))
+write_biom(st.biom, "seq_nochim.biom")
+```
+
+```{r}
+library(seqinr)
+seqs <- read.fasta("seq_nochim.fa")
+seqs <- sapply(seqs, paste, collapse = "")
+seqs <- toupper(as.vector(seqs))
+stopifnot(seqs == colnames(seqtab_nochim))
+```
+
+## Install PICRUSt2
+```{bash, eval=FALSE}
+q()
+n
+# create a new conda environment
+cd ~
+module purge
+module load conda2/4.2.13
+conda create -n picrust2 -c bioconda -c conda-forge picrust2=2.2.0_b
+```
+
+## Run PICRUSt2
+```{bash, eval=FALSE}
+# activate the environment  
+source activate picrust2
+cd /n/data1/joslin/cores/bbcore/celiac_disease_16sn/picrust2
+picrust2_pipeline.py -s seq_nochim.fa -i seq_nochim.biom -o picrust2_out_pipeline -p 4
+# deactivate virtual environment
+conda deactivate
+```
+
+We perform function prediction by PICRUSt2.   
+
+```{r parse}
+# meta data
+md <- read.csv("../data/CeD new label (2).csv")
+md_age <- read.csv("../data/Celiakibarn 190906.csv")
+md <- merge(md, md_age, all = TRUE)
+rm(md_age)
+
+md <- md[order(md$New.Sample.ID), ]
+md <- md[rep(1:nrow(md), each = 3),]
+md$New.Sample.ID <- paste0("S", md$New.Sample.ID, c("", ".neg", ".pos"))
+md$Sort <- rep(c("Presort", "IGneg", "IGpos"), time = nrow(md)/3)
+md$Disease.status <- sapply(md$Disease.status, FUN = switch, A = "Celiac", B = "Control")
+md$ABIS.no <- paste0("ABIS", md$ABIS.no)
+
+md$Disease.status <- factor(md$Disease.status, levels = c("Control", "Celiac"))
+md$Sorted <- md$Sort <- factor(md$Sort, levels = c("Presort", "IGneg", "IGpos"))
+levels(md$Sorted) <- list(Presort = "Presort", Postsort = c("IGneg", "IGpos"))
+md <- md[order(md$Sort, md$Disease.status, md$Age, md$ABIS.no), ]
+md$Group <- paste(md$Sort, md$Disease.status, md$Age, sep = "_")
+md$Group <- factor(md$Group, levels = unique(md$Group))
+md$Age <- factor(paste0(md$Age, "year"))
+md <- data.frame(md, row.names = "New.Sample.ID")
+
+## pwys data
+pwys.tab <- read.delim("picrust2_out_pipeline/pathways_out/path_abun_unstrat.tsv.gz", row.names = 1)
+# dim(pwys.tab)
+grp <- gsub("\\.[1-2]$", "", gsub("\\.[1-2]\\.", ".", colnames(pwys.tab)))
+pwys.tab <- t(rowsum(t(pwys.tab), group = grp))
+rm(grp)
+# dim(pwys.tab)
+nms <- intersect(rownames(md), colnames(pwys.tab))
+pwys.tab <- pwys.tab[,nms]
+md <- md[nms, ]
+
+## named pwys
+pwys.nm <- setNames(rownames(pwys.tab), nm=rownames(pwys.tab))
+pwys.nm <- gsub("PWY(|0)-[0-9]+$|P[0-9]+$", NA,
+                gsub("-PWY$", "", pwys.nm))
+```
+
+## Annotate pathways
+```{r annot}
+annot <- read.delim("B:/annotations/metacyc/All_pathways_of_MetaCyc.txt", row.names = 1)
+colnames(annot) <- "Pathway"
+annot$Pathway <- gsub("<[A-Za-z]>|</[A-Za-z]>", "", annot$Pathway)
+```
+
+## Filter and log transformation
+```{r filt}
+pwys.tab <- pwys.tab[rowSums(pwys.tab >= 10) > 5, ]
+# range(pwys.tab)
+pwys.tab <- log2(pwys.tab+1)
+
+
+boxplot(pwys.tab)
+hist(pwys.tab)
+
+v <- voom(2^pwys.tab, plot = TRUE)
+
+#save(pwys.tab, md, annot, file = "pwys.rda")
+```
+
+To filter out low abundant pathways, we keep KO pathways that have abundance at least 10 in 5 samples. There are 377 KO terms after filtering. We then perform log transfomation on the pathway abundance.  
+
+## Test for differential KO terms
+```{r limma}
+contr.v <- c(Celiac_vs_Control_in_Presort_Age1 = "Presort_Celiac_1 - Presort_Control_1",
+             Celiac_vs_Control_in_IGneg_Age1 = "IGneg_Celiac_1 - IGneg_Control_1",
+             Celiac_vs_Control_in_IGpos_Age1 = "IGpos_Celiac_1 - IGpos_Control_1", 
+             IGpos_vs_IGneg_in_Control_Age1 = "IGpos_Control_1 - IGneg_Control_1",  
+             IGpos_vs_IGneg_in_Celiac_Age1 = "IGpos_Celiac_1 - IGneg_Celiac_1",
+             
+             Celiac_vs_Control_in_Presort_Age2.5 = "Presort_Celiac_2.5 - Presort_Control_2.5",
+             Celiac_vs_Control_in_IGneg_Age2.5 = "IGneg_Celiac_2.5 - IGneg_Control_2.5",
+             Celiac_vs_Control_in_IGpos_Age2.5 = "IGpos_Celiac_2.5 - IGpos_Control_2.5", 
+             IGpos_vs_IGneg_in_Control_Age2.5 = "IGpos_Control_2.5 - IGneg_Control_2.5",  
+             IGpos_vs_IGneg_in_Celiac_Age2.5 = "IGpos_Celiac_2.5 - IGneg_Celiac_2.5",
+             
+             Celiac_vs_Control_in_Presort_Age5 = "Presort_Celiac_5 - Presort_Control_5",
+             Celiac_vs_Control_in_IGneg_Age5 = "IGneg_Celiac_5 - IGneg_Control_5",
+             Celiac_vs_Control_in_IGpos_Age5 = "IGpos_Celiac_5 - IGpos_Control_5", 
+             IGpos_vs_IGneg_in_Control_Age5 = "IGpos_Control_5 - IGneg_Control_5",  
+             IGpos_vs_IGneg_in_Celiac_Age5 = "IGpos_Celiac_5 - IGneg_Celiac_5")
+
+
+mtt <- limma_contrasts(pwys.tab, grp = md$Group, contrast.v = contr.v, trend = TRUE)
+mtt.df <- data.frame(signif(mtt, 3), annot[rownames(mtt), , drop = FALSE])
+
+signif_hist(mtt, name = "signif_hist", pi0 = TRUE)
+write.csv(mtt.df, "pwys_stats.csv", na = "")
+```
+
+To discover the differential KO terms, we use limma, an R package that powers differential expression analyses [@ritchie_2015]. We perform We perform moderated t-test for the following comparisons: between any 2 disease status at different age and sorting, or between IGpos and IGneg in different age and disease status.    
+The histograms of significance are at [signif_hist.pdf](./signif_hist.pdf). If no KO terms were associated with the phenotype, we would expect the p-value histogram to be flat and all FDRs to be near one. The more associated KO terms there are, the more enrichment there is at low p-values, the lower will be the FDRs.  We also estimate the proportion of the true null hypothesis (i.e. non-significant KO terms) [@langaas_2005].    
+KO term statistics tables for all KO terms [pwys_stats.csv](./pwys_stats.csv). The table contains the average log2 abundance of each group, p-values, FDR, log fold-change, fold-change, and pathway information.      
+
+## Plots
+```{r plots}
+## boxplot
+top_pwy1 <- select.top(mtt.df, contrasts.v = contr.v[grep("Presort", names(contr.v))])
+pdf("top_pwys_boxplot_presort.pdf", 9, 3)
+for (pwy in top_pwy1){
+    dat2p <- data.frame(logabun = pwys.tab[pwy, md$Sort == "Presort"], md[md$Sort == "Presort", ])
+     
+    ggp <- ggplot(data = dat2p, mapping = aes(x = Disease.status, y = logabun)) + theme_bw()
+    ggp <- ggp + ggtitle(substr(annot[pwy, "Pathway"], 1, 80)) + theme(legend.position = "none") + ylab("Log2 abundance")
+    ggp <- ggp + geom_boxplot(mapping = aes(fill = Disease.status)) + facet_grid(~ Age)
+    plot(ggp)
+}
+dev.off()
+
+top_pwy2 <- select.top(mtt.df, contrasts.v = contr.v[-grep("Presort", names(contr.v))])
+pdf("top_pwys_boxplot_postsort.pdf", 9, 5)
+for (pwy in top_pwy2){
+    dat2p <- data.frame(logabun = pwys.tab[pwy, md$Sort != "Presort"], md[md$Sort != "Presort", ])
+     
+    ggp <- ggplot(data = dat2p, mapping = aes(x = Disease.status, y = logabun)) + theme_bw()
+    ggp <- ggp + ggtitle(substr(annot[pwy, "Pathway"], 1, 80)) + theme(legend.position = "none") + ylab("Log2 abundance")
+    ggp <- ggp + geom_boxplot(mapping = aes(fill = Disease.status)) + facet_grid(Sort~ Age)
+    plot(ggp)
+}
+dev.off()
+
+## heatmaps
+md.df1 <- md[md$Sort == "Presort", c("Disease.status", "Age")]
+gaps.col1 <- which(diff(as.numeric(as.factor(md.df1$Age)), lag=1) != 0)
+ezheat(pwys.tab[top_pwy1, md$Sort == "Presort"], pheno.df = md.df1,  sc = "z", reorder_rows = TRUE, 
+       labrows = substr(annot[top_pwy1, "Pathway"], 1, 80), labcols = "",
+       gaps_col = gaps.col1, main = "Log2 abundance", name = "top_pwys_heat_presort", height = 8, width = 16, clip = 2)
+
+md.df2 <- md[md$Sort != "Presort", c("Disease.status", "Age", "Sort")]
+gaps.col2 <- which(diff(as.numeric(as.factor(md.df2$Age)), lag=1) != 0)
+ezheat(pwys.tab[top_pwy2, md$Sort != "Presort"], pheno.df = md.df2,  sc = "z", reorder_rows = TRUE, 
+       labrows = substr(annot[top_pwy2, "Pathway"], 1, 80), labcols = "",
+       gaps_col = gaps.col2, main = "Log2 abundance", name = "top_pwys_heat_postsort", height = 8, width = 30, clip = 2)
+```
+
+Equal numbers of top KO terms (based on p-values) are selected from each comparison. The boxplots for top KO terms are at [top_pwys_boxplot_presort.pdf](./top_pwys_boxplot_presort.pdf), and [top_pwys_boxplot_postsort.pdf](./top_pwys_boxplot_postsort.pdf). The same sets of top KO terms are use in heatmaps [top_pwys_heat_presort.pdf](./top_pwys_heat_presort.pdf) and [top_pwys_heat_postsort.pdf](./top_pwys_heat_postsort.pdf).
+
+
+```{r check}
+stopifnot(rownames(pwys.tab) %in% rownames(annot))
+stopifnot(colnames(pwys.tab) == rownames(md))
+stopifnot(rownames(mtt.df)[1] == "PWY-7376")
+stopifnot(!is.na(mtt.df$Pathway))
+stopifnot(mtt.df$Pathway != "")
+```
+
+## Reference
+

@@ -1,0 +1,65 @@
+---
+title: "Correlation of Predicted KEGG Pathways and OTUs"
+author: "Hui/Jonathan"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE)
+setwd("B:/")
+source("fcns/config.r")
+setwd("external/altindis/celiac_disease_16sn/corr")
+library(pheatmap)
+```
+
+## Data
+OTU data [otu.rda](../limma/otu.rda),  
+Differential OTU statistcs [otu_stats.csv](../limma/otu_stats.csv).  
+
+PICRUSt2 KEGG pathway data [kegg_pwys.rda](../picrust2/kegg_pwys.rda),  
+Differential KEGG pathway statistcs [kegg_pwys_stats.csv](../picrust2/kegg_pwys_stats.csv).  
+
+```{r parse}
+load("../limma/otu.rda")
+annot_otu <- annot; rm(annot)
+
+load("../picrust2/kegg_pwys.rda")
+annot_kegg <- annot; rm(annot, md)
+stopifnot(colnames(logcpm) == colnames(pwys.tab))
+
+dat_otu <- read.csv("../limma/otu_stats.csv", row.names = 1)
+dat_kegg <- read.csv("../picrust2/kegg_pwys_stats.csv", row.names = 1)
+```
+
+## Correlation
+```{r corr}
+ntop <- 20
+ages <- c(1, 2.5, 5)
+corr_res <- list()
+for(age in ages){
+  pcol <- paste0("Celiac_vs_Control_in_Presort_Age", age, ".p")
+  topo <- rownames(dat_otu)[order(dat_otu[, pcol])][1:ntop]
+  topk <- rownames(dat_kegg)[order(dat_kegg[, pcol])][1:ntop]
+  samp <- rownames(pheno)[pheno$Sort == "Presort" & pheno$Age == paste0(age, "year")]
+  
+  corr_tab <- matrix(0, nrow = ntop, ncol = ntop, dimnames = list(topo, topk))
+  for(o in topo){
+    for(k in topk){
+      corr_tab[o, k] <- cor(x = logcpm[o, samp], y = pwys.tab[k, samp], method = "pearson")
+    }
+  }
+  dimnames(corr_tab) <- list(annot_otu[topo, "Taxa"], annot_kegg[topk, "Pathway"])
+  
+  nm <- paste0("Age", age, "_presort")
+  corr_res[[nm]] <- data.frame(Taxa = rownames(corr_tab), corr_tab, check.names = FALSE)
+  
+  num <- max(nchar(rownames(corr_tab)))
+  pheatmap(corr_tab, cluster_rows = TRUE, cluster_cols = TRUE, color = colorRampPalette(c("blue", "white", "red"))(100), main = "Pearson Correlation",
+           filename = paste0(nm, "_otu_kegg_corr_heat.pdf"), height = 8, width = 8 + num/25)
+}
+
+writexl::write_xlsx(corr_res, "presort_otu_kegg_corr.xlsx")
+```
+
+We performed Pearson correlation tests for the selected metabolites and predicted KEGG pathways.  The heatmaps [Age1_presort_otu_kegg_corr_heat.pdf](./Age1_presort_otu_kegg_corr_heat.pdf), [Age2.5_presort_otu_kegg_corr_heat.pdf](./Age2.5_presort_otu_kegg_corr_heat.pdf), and [Age5_presort_otu_kegg_corr_heat.pdf](./Age5_presort_otu_kegg_corr_heat.pdf) show the correlation coefficients.  

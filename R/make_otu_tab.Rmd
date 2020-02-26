@@ -1,0 +1,172 @@
+---
+title: "Make OTU Table for 16S DNA-seq"
+author: "Hui/Jonathan"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: word_document
+---
+```{bash, echo = FALSE, eval = FALSE}
+ssh hp135@o2.hms.harvard.edu 
+cd /n/data1/joslin/cores/bbcore/celiac_disease_16sn/dada2
+srun -c 10 -p interactive --pty --mem-per-cpu=10G -t 0-12 /bin/bash
+module load gcc/6.2.0 R/3.5.1; R
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE, eval = FALSE)
+#setwd("/home/hp135")
+setwd("B:/")
+source("fcns/config.r")
+#setwd("/n/data1/joslin/cores/bbcore/celiac_disease_16sn/dada2")
+setwd("external/altindis/celiac_disease_16sn/dada2")
+library(dada2)
+library(ShortRead)
+```
+
+## Purpose
+Make OTU table for 16S DNA-seq by R package *dada2* [1].   
+The results are in folder [celiac_disease_16sn/dada2](../dada2/).  
+
+## Data
+The fastq files are in folder [raw_data](../raw_data/). 
+
+```{r get raw read path}
+path <- "../raw_data" 
+fn <- list.files(path, pattern = "\\.fastq\\.gz$", full.names = TRUE, recursive = TRUE)
+fnFs<- grep("R1.*\\.fastq\\.gz$", fn, value = TRUE)
+fnRs<- grep("R2.*\\.fastq\\.gz$", fn, value = TRUE)
+stopifnot(gsub("R1", "", fnFs) == gsub("R2", "", fnRs))
+samp <- paste0("S", gsub("_.*", "", gsub(".*/", "", fnFs)))
+
+sbj <- gsub("\\.(pos|neg)", "", samp)
+table(sbj)
+```
+
+## Inspect read quality profiles
+```{r read qc}
+pdf("reads_quality.pdf")
+plotQualityProfile(fnFs[21:22])
+plotQualityProfile(fnRs[21:22])
+dev.off()
+```
+
+We visualize the quality profiles of the forward and reverse reads of the 2 randomly selected samples. Both forward and reverse reads are good quality. See [reads_quality.pdf](./reads_quality.pdf). We will only trim the first 10 and last 50 nucleotides to avoid less well-controlled errors.   
+
+## Filter and trim reads
+```{r filter trim}
+# Make directory and filenames for the filtered fastqs
+filt_path <- "../filtered_data"
+if(!file_test("-d", filt_path)) dir.create(filt_path)
+filtFs <- file.path(filt_path, paste0(samp, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(samp, "_R_filt.fastq.gz"))
+
+# Filter
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, trimLeft = c(10, 10), truncLen = c(200, 200), maxN = 0, maxEE = c(2, 2), truncQ = 2, rm.phix = TRUE, compress = TRUE, 
+                     multithread = FALSE, verbose = TRUE)
+out <- as.data.frame(out)
+out$percent.out <- round(out$reads.out / out$reads.in * 100, 1)
+mean(out$percent.out)
+```
+
+We use the standard filtering parameters: maxN = 0 (no Ns), truncQ = 2, rm.phix = TRUE (remove phix) and maxEE = 2 (maximum number of expected errors allowed in a read). We also trim the first 10 and last 50 nucleotides in forward and reverse reads. There are about 91% of reads remained after filtering and trimming.  
+
+## Learn the Error Rates
+```{r error rate}
+errF <- learnErrors(filtFs, multithread = 10, nbases = 1e+8)
+errR <- learnErrors(filtRs, multithread = 10, nbases = 1e+8)
+
+pdf("error_rates.pdf")
+plotErrors(errF, nominalQ = TRUE)
+plotErrors(errR, nominalQ = TRUE)
+dev.off()
+```
+
+The method learns the error model from a subset of the filtered data (100318290 total bases in 527991 reads from 22 samples). We visualize the estimated error rates. [error_rates.pdf](./error_rates.pdf). The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. We can see the estimated error rates (black line) are a good fit to the observed rates (points).     
+
+## Dereplication
+```{r dereplicate}
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by samp
+names(derepFs) <- samp
+names(derepRs) <- samp
+```
+
+Combines all identical sequencing reads into into "unique sequences" to reduce computation time.   
+
+## Sample Inference
+```{r}
+dadaFs <- dada(derepFs, err = errF, multithread = 10, pool = TRUE)
+dadaRs <- dada(derepRs, err = errR, multithread = 10, pool = TRUE)
+
+# Inspecting the returned dada-class objects
+dadaFs[[1]]
+dadaRs[[1]]
+
+save.image(file = "dat.RData")
+```
+
+Apply the core sample inference algorithm to the dereplicated data. We use the standard pooled processing, in which all samples are pooled together for sample inference.   
+
+## Merge the denoised forward and reverse reads
+```{r merge}
+load("dat.RData")
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE)
+
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+Merge the forward and reverse reads together to obtain the full denoised sequences. 
+
+## Construct a sequence table
+```{r seqtab}
+seqtab <- makeSequenceTable(mergers)
+
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+seqtab2 <- seqtab[, nchar(colnames(seqtab)) >= 232]
+dim(seqtab2)
+```
+
+Construct the amplicon sequence variant table (ASV) table.  Also, remove non-target-length sequences i.e. much shorter than the expected length.  
+
+## Remove chimeras
+```{r rm chi}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method = "consensus", multithread = 10, verbose = TRUE)
+saveRDS(seqtab.nochim, "seqtab_nochim.rds")
+dim(seqtab.nochim)
+
+(1 - sum(seqtab.nochim)/sum(seqtab2)) *100
+```
+
+Remove chimeras, which are about 21% of the merged sequence reads.  
+
+## Track reads through the pipeline
+```{r track}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "percent_filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+track$percent_nonchim <- round(track$nonchim / track$input * 100, 1)
+mean(track$percent_nonchim)
+rownames(track) <- samp
+write.csv(track, "track_reads.csv")
+```
+
+We keep the more than half of our raw reads (~ 67%), and there is over-large drop associated with chimeras removal step. See the statistics  [track_reads.csv](./track_reads.csv).  
+
+## Assign taxonomy
+```{r taxa}
+annot <- assignTaxonomy(seqtab.nochim, "/n/data1/joslin/cores/bbcore/annotations/16S_db/rdp_train_set_16.fa.gz", multithread = 10)
+saveRDS(annot, "annot.rds")
+annot.add.species <- addSpecies(annot, "/n/data1/joslin/cores/bbcore/annotations/16S_db/rdp_species_assignment_16.fa.gz")
+saveRDS(annot.add.species, "annot_add_species.rds")
+```
+
+Assign taxonomy to the sequence variants using  the naive Bayesian classifier method and the Ribosomal Database Project's Training Set 16.  
+
+## Reference
+[1] Callahan BJ, McMurdie PJ, Rosen MJ, Han AW, Johnson AJA, Holmes SP (2016). “DADA2: High-resolution sample inference from Illumina amplicon data.” Nature Methods, 13, 581-583. doi: 10.1038/nmeth.3869.  
